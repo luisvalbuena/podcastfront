@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState } from 'react';
 import io from 'socket.io-client';
 import Peer from 'simple-peer';
-import api from '../api/axios'; // Importamos tu instancia de axios
 
+// Conexión al socket usando la variable de entorno
 const socket = io(import.meta.env.VITE_API_URL || 'http://localhost:3001');
 
 export const useWebRTC = (roomId) => {
@@ -11,58 +11,20 @@ export const useWebRTC = (roomId) => {
   
   const peerRef = useRef();
   const localStreamRef = useRef();
-  const mediaRecorderRef = useRef(null);
-  const recordedChunks = useRef([]);
   const initialized = useRef(false);
 
-  // --- LÓGICA DE GRABACIÓN Y SUBIDA ---
-  const startRecording = (stream) => {
-    try {
-      recordedChunks.current = [];
-      // Grabamos en webm (formato estándar de MediaRecorder)
-      const recorder = new MediaRecorder(stream, { 
-        mimeType: 'video/webm;codecs=vp8,opus' 
-      });
-
-      recorder.ondataavailable = (e) => {
-        if (e.data.size > 0) recordedChunks.current.push(e.data);
-      };
-
-      recorder.onstop = async () => {
-        console.log("📦 Grabación finalizada. Preparando envío...");
-        const blob = new Blob(recordedChunks.current, { type: 'video/webm' });
-        await uploadToCloudinary(blob);
-      };
-
-      recorder.start();
-      mediaRecorderRef.current = recorder;
-      console.log("⏺️ Grabación iniciada en el estudio.");
-    } catch (err) {
-      console.error("❌ No se pudo iniciar la grabación:", err);
-    }
-  };
-
-  const uploadToCloudinary = async (videoBlob) => {
-    try {
-      console.log("☁️ Subiendo sesión a Cloudinary via Backend...");
-      const response = await api.post('/api/upload-session', videoBlob, {
-        headers: { 'Content-Type': 'video/webm' }
-      });
-      console.log("✅ Sesión guardada con éxito:", response.data.url);
-    } catch (err) {
-      console.error("❌ Error al subir la sesión:", err);
-    }
-  };
-
   useEffect(() => {
-    if (initialized.current) return;
+    // Evitamos doble ejecución en React Strict Mode
+    if (initialized.current || !roomId) return;
+    initialized.current = true;
 
     const sessionData = localStorage.getItem('albatros_session');
-    if (!sessionData || !roomId) return;
+    if (!sessionData) return;
     const { role: myRole } = JSON.parse(sessionData);
 
     const initConnection = async () => {
       try {
+        // 1. Capturamos cámara y audio
         const stream = await navigator.mediaDevices.getUserMedia({ 
           video: { width: 640, height: 360 },
           audio: true 
@@ -70,18 +32,22 @@ export const useWebRTC = (roomId) => {
         
         localStreamRef.current = stream;
         setConnectionStatus('ready');
-        initialized.current = true;
 
+        // 2. Nos unimos a la sala
         socket.emit('join-room', { roomId, role: myRole });
 
+        // 3. Escuchamos cuando entra el otro redactor
         socket.on('user-joined', ({ role }) => {
           if (role !== myRole) {
+            console.log(`👤 El ${role} se ha unido. Iniciando llamada...`);
             const peer = createPeer(true, stream, roomId, myRole);
             peerRef.current = peer;
           }
         });
 
+        // 4. Recibimos la señal de respuesta/oferta
         socket.on('signal-received', (data) => {
+          console.log("📡 Recibiendo señal del compañero...");
           if (!peerRef.current) {
             const peer = createPeer(false, stream, roomId, myRole);
             peerRef.current = peer;
@@ -90,24 +56,38 @@ export const useWebRTC = (roomId) => {
         });
 
       } catch (err) {
+        console.error("❌ Error de acceso a medios:", err);
         setConnectionStatus('error');
       }
     };
 
     const createPeer = (initiator, stream, room, role) => {
-      const peer = new Peer({ initiator, trickle: false, stream });
+      // Configuramos STUN servers básicos para que la señal atraviese firewalls
+      const peer = new Peer({ 
+        initiator, 
+        trickle: false, 
+        stream,
+        config: {
+          iceServers: [
+            { urls: 'stun:stun.l.google.com:19302' },
+            { urls: 'stun:stun1.l.google.com:19302' }
+          ]
+        }
+      });
 
       peer.on('signal', (signal) => {
         socket.emit('signal', { toRoom: room, signal, fromRole: role });
       });
 
       peer.on('stream', (remote) => {
-        console.log("🎥 ¡CONEXIÓN ESTABLECIDA!");
+        console.log("🎥 ¡Éxito! Stream remoto recibido.");
         setRemoteStream(remote);
         setConnectionStatus('connected');
-        
-        // Iniciamos la grabación del stream remoto (lo que dice el otro redactor)
-        startRecording(remote);
+      });
+
+      peer.on('error', (err) => {
+        console.error("❌ Error en el Peer:", err);
+        setConnectionStatus('error');
       });
 
       return peer;
@@ -115,19 +95,21 @@ export const useWebRTC = (roomId) => {
 
     initConnection();
 
+    // Limpieza al salir de la sala
     return () => {
-      // Al desmontar (salir de la sala), detenemos la grabación para disparar la subida
-      if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
-        mediaRecorderRef.current.stop();
-      }
-      
       socket.off('user-joined');
       socket.off('signal-received');
-      initialized.current = false;
       if (peerRef.current) peerRef.current.destroy();
-      if (localStreamRef.current) localStreamRef.current.getTracks().forEach(t => t.stop());
+      if (localStreamRef.current) {
+        localStreamRef.current.getTracks().forEach(t => t.stop());
+      }
+      initialized.current = false;
     };
   }, [roomId]);
 
-  return { remoteStream, connectionStatus, localStream: localStreamRef.current };
+  return { 
+    remoteStream, 
+    connectionStatus, 
+    localStream: localStreamRef.current 
+  };
 };
